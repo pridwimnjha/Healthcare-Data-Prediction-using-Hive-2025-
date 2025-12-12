@@ -1,0 +1,391 @@
+```bash
+hive -f hql/create_table_and_load.hql
+hive -f hql/queries_analysis.hql
+hive -f hql/naive_bayes_insurance_final.hql
+hive -f hql/nb_evaluation_insurance.hql
+```
+
+---
+
+### 1) `create_table_and_load.hql`
+
+```sql
+-- Create DB, table and point to HDFS location (assumes CSV in /healthcare)
+CREATE DATABASE IF NOT EXISTS healthcare_db;
+USE healthcare_db;
+
+-- Drop table if exists (safe)
+DROP TABLE IF EXISTS healthcare;
+
+-- Create external table reading from HDFS /healthcare
+CREATE EXTERNAL TABLE IF NOT EXISTS healthcare (
+  Patient_ID STRING,
+  Name STRING,
+  State STRING,
+  Disease STRING,
+  Age INT,
+  Gender STRING,
+  Date STRING,
+  Treatment_Cost INT,
+  Payment_Method STRING,
+  Outcome STRING,
+  Insurance STRING
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+  "separatorChar" = ",",
+  "quoteChar" = "\""
+)
+STORED AS TEXTFILE
+LOCATION '/healthcare'
+TBLPROPERTIES ("skip.header.line.count"="1");
+
+-- Quick verify queries (run manually if you want)
+-- SELECT COUNT(*) FROM healthcare;
+-- SELECT * FROM healthcare LIMIT 10;
+```
+
+---
+
+### 2) `queries_analysis.hql`
+
+```sql
+-- 10 analytical queries (run as a script or execute individually)
+USE healthcare_db;
+
+-- Query 1: Most common disease overall
+SELECT Disease, COUNT(*) AS patient_count
+FROM healthcare
+GROUP BY Disease
+ORDER BY patient_count DESC
+LIMIT 1;
+
+-- Query 2: State-wise most common disease (top disease per state)
+SELECT State, Disease, COUNT(*) AS case_count
+FROM healthcare
+GROUP BY State, Disease
+ORDER BY State ASC, case_count DESC;
+
+-- Query 3: Average treatment cost per disease
+SELECT Disease, ROUND(AVG(Treatment_Cost),2) AS avg_cost
+FROM healthcare
+GROUP BY Disease
+ORDER BY avg_cost DESC;
+
+-- Query 4: Top 5 states with maximum patients
+SELECT State, COUNT(*) AS total_patients
+FROM healthcare
+GROUP BY State
+ORDER BY total_patients DESC
+LIMIT 5;
+
+-- Query 5: Payment method distribution
+SELECT Payment_Method, COUNT(*) AS total_payments
+FROM healthcare
+GROUP BY Payment_Method
+ORDER BY total_payments DESC;
+
+-- Query 6: Age group vs Disease trend (derive AgeGroup inline)
+SELECT
+  CASE
+    WHEN Age < 18 THEN 'Child'
+    WHEN Age BETWEEN 18 AND 35 THEN 'YoungAdult'
+    WHEN Age BETWEEN 36 AND 55 THEN 'MiddleAged'
+    ELSE 'Senior'
+  END AS AgeGroup,
+  Disease,
+  COUNT(*) AS total_cases
+FROM healthcare
+GROUP BY
+  CASE
+    WHEN Age < 18 THEN 'Child'
+    WHEN Age BETWEEN 18 AND 35 THEN 'YoungAdult'
+    WHEN Age BETWEEN 36 AND 55 THEN 'MiddleAged'
+    ELSE 'Senior'
+  END,
+  Disease
+ORDER BY AgeGroup, total_cases DESC;
+
+-- Query 7: Highest treatment cost per state
+SELECT State, MAX(Treatment_Cost) AS highest_cost
+FROM healthcare
+GROUP BY State
+ORDER BY highest_cost DESC;
+
+-- Query 8: Insurance usage pattern
+SELECT Insurance, COUNT(*) AS patient_count
+FROM healthcare
+GROUP BY Insurance
+ORDER BY patient_count DESC;
+
+-- Query 9: Disease with highest mortality rate (Deceased)
+SELECT Disease,
+       SUM(CASE WHEN Outcome='Deceased' THEN 1 ELSE 0 END) AS death_count,
+       COUNT(*) AS total_cases,
+       ROUND(100*SUM(CASE WHEN Outcome='Deceased' THEN 1 ELSE 0 END)/COUNT(*),2) AS mortality_rate
+FROM healthcare
+GROUP BY Disease
+ORDER BY mortality_rate DESC
+LIMIT 5;
+
+-- Query 10: Monthly patient admission trend (YYYY-MM)
+SELECT SUBSTR(Date,1,7) AS month, COUNT(*) AS total_admissions
+FROM healthcare
+GROUP BY SUBSTR(Date,1,7)
+ORDER BY month ASC;
+```
+
+---
+
+### 3) `naive_bayes_insurance_final.hql`
+
+```sql
+-- Naive Bayes-like classifier implemented in Hive
+USE healthcare_db;
+
+-- Clean intermediate tables (safe)
+DROP TABLE IF EXISTS healthcare_features;
+DROP TABLE IF EXISTS nb_total;
+DROP TABLE IF EXISTS nb_priors;
+DROP TABLE IF EXISTS p_yes;
+DROP TABLE IF EXISTS p_no;
+DROP TABLE IF EXISTS nb_likelihood_disease;
+DROP TABLE IF EXISTS nb_likelihood_state;
+DROP TABLE IF EXISTS nb_likelihood_gender;
+DROP TABLE IF EXISTS nb_likelihood_agegroup;
+DROP TABLE IF EXISTS nb_likelihood_payment;
+DROP TABLE IF EXISTS nb_likelihood_cost;
+DROP TABLE IF EXISTS nb_insurance_count;
+DROP TABLE IF EXISTS ic_yes;
+DROP TABLE IF EXISTS ic_no;
+DROP TABLE IF EXISTS v_disease;
+DROP TABLE IF EXISTS v_state;
+DROP TABLE IF EXISTS v_gender;
+DROP TABLE IF EXISTS v_agegroup;
+DROP TABLE IF EXISTS v_payment;
+DROP TABLE IF EXISTS v_cost;
+DROP TABLE IF EXISTS nb_vocab;
+DROP TABLE IF EXISTS insurance_predictions;
+
+-- 1) Derived categorical table
+CREATE TABLE healthcare_features AS
+SELECT
+  Patient_ID,
+  State,
+  Disease,
+  Age,
+  CASE
+    WHEN Age IS NULL THEN 'UnknownAge'
+    WHEN Age < 18 THEN 'Child'
+    WHEN Age BETWEEN 18 AND 35 THEN 'YoungAdult'
+    WHEN Age BETWEEN 36 AND 55 THEN 'MiddleAged'
+    ELSE 'Senior'
+  END AS AgeGroup,
+  COALESCE(Gender,'Unknown') AS Gender,
+  COALESCE(Treatment_Cost,0) AS Treatment_Cost,
+  CASE
+    WHEN Treatment_Cost IS NULL OR Treatment_Cost < 5000 THEN 'Low'
+    WHEN Treatment_Cost BETWEEN 5000 AND 15000 THEN 'Medium'
+    WHEN Treatment_Cost BETWEEN 15001 AND 30000 THEN 'High'
+    ELSE 'VeryHigh'
+  END AS Cost_Bucket,
+  COALESCE(Payment_Method,'Unknown') AS Payment_Method,
+  COALESCE(Outcome,'Unknown') AS Outcome,
+  COALESCE(Insurance,'No') AS Insurance
+FROM healthcare;
+
+-- 2) Total and priors
+CREATE TABLE nb_total AS SELECT COUNT(*) AS total_count FROM healthcare_features;
+
+CREATE TABLE nb_priors AS
+SELECT f.Insurance,
+       COUNT(*) AS cnt,
+       ROUND(COUNT(*) / t.total_count, 6) AS prior_prob
+FROM healthcare_features f
+CROSS JOIN nb_total t
+GROUP BY f.Insurance, t.total_count;
+
+CREATE TABLE p_yes AS SELECT prior_prob FROM nb_priors WHERE Insurance='Yes' LIMIT 1;
+CREATE TABLE p_no  AS SELECT prior_prob FROM nb_priors WHERE Insurance='No'  LIMIT 1;
+
+-- 3) Likelihood counts (per feature value and insurance)
+CREATE TABLE nb_likelihood_disease AS
+SELECT Disease, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY Disease, Insurance;
+
+CREATE TABLE nb_likelihood_state AS
+SELECT State, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY State, Insurance;
+
+CREATE TABLE nb_likelihood_gender AS
+SELECT Gender, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY Gender, Insurance;
+
+CREATE TABLE nb_likelihood_agegroup AS
+SELECT AgeGroup, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY AgeGroup, Insurance;
+
+CREATE TABLE nb_likelihood_payment AS
+SELECT Payment_Method AS Payment_Method, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY Payment_Method, Insurance;
+
+CREATE TABLE nb_likelihood_cost AS
+SELECT Cost_Bucket, Insurance, COUNT(*) AS cnt
+FROM healthcare_features
+GROUP BY Cost_Bucket, Insurance;
+
+-- 4) Class counts and vocabulary sizes
+CREATE TABLE nb_insurance_count AS
+SELECT Insurance, COUNT(*) AS ins_count
+FROM healthcare_features
+GROUP BY Insurance;
+
+CREATE TABLE ic_yes AS SELECT ins_count FROM nb_insurance_count WHERE Insurance='Yes' LIMIT 1;
+CREATE TABLE ic_no  AS SELECT ins_count FROM nb_insurance_count WHERE Insurance='No'  LIMIT 1;
+
+CREATE TABLE v_disease AS SELECT COUNT(DISTINCT Disease) AS v FROM healthcare_features;
+CREATE TABLE v_state   AS SELECT COUNT(DISTINCT State)   AS v FROM healthcare_features;
+CREATE TABLE v_gender  AS SELECT COUNT(DISTINCT Gender)  AS v FROM healthcare_features;
+CREATE TABLE v_agegroup AS SELECT COUNT(DISTINCT AgeGroup) AS v FROM healthcare_features;
+CREATE TABLE v_payment AS SELECT COUNT(DISTINCT Payment_Method) AS v FROM healthcare_features;
+CREATE TABLE v_cost    AS SELECT COUNT(DISTINCT Cost_Bucket) AS v FROM healthcare_features;
+
+CREATE TABLE nb_vocab AS
+SELECT vd.v AS v_disease, vs.v AS v_state, vg.v AS v_gender,
+       va.v AS v_agegroup, vp.v AS v_payment, vc.v AS v_cost
+FROM v_disease vd
+CROSS JOIN v_state vs
+CROSS JOIN v_gender vg
+CROSS JOIN v_agegroup va
+CROSS JOIN v_payment vp
+CROSS JOIN v_cost vc
+LIMIT 1;
+
+-- 5) Prediction: compute log posteriors and choose max
+CREATE TABLE insurance_predictions AS
+SELECT f.Patient_ID,
+       f.Disease,
+       f.State,
+       f.Gender,
+       f.AgeGroup,
+       f.Cost_Bucket,
+       f.Payment_Method,
+       f.Outcome,
+       f.Insurance AS actual_insurance,
+
+       -- log posteriors
+       (
+         LN(py.prior_prob)
+         + LN( (COALESCE(dy.cnt,0) + 1) / (icy.ins_count + nv.v_disease) )
+         + LN( (COALESCE(sy.cnt,0) + 1) / (icy.ins_count + nv.v_state) )
+         + LN( (COALESCE(gy.cnt,0) + 1) / (icy.ins_count + nv.v_gender) )
+         + LN( (COALESCE(ay.cnt,0) + 1) / (icy.ins_count + nv.v_agegroup) )
+         + LN( (COALESCE(pmt_y.cnt,0) + 1) / (icy.ins_count + nv.v_payment) )
+         + LN( (COALESCE(cy.cnt,0) + 1) / (icy.ins_count + nv.v_cost) )
+       ) AS log_posterior_yes,
+
+       (
+         LN(pn.prior_prob)
+         + LN( (COALESCE(dn.cnt,0) + 1) / (icn.ins_count + nv.v_disease) )
+         + LN( (COALESCE(sn.cnt,0) + 1) / (icn.ins_count + nv.v_state) )
+         + LN( (COALESCE(gn.cnt,0) + 1) / (icn.ins_count + nv.v_gender) )
+         + LN( (COALESCE(an.cnt,0) + 1) / (icn.ins_count + nv.v_agegroup) )
+         + LN( (COALESCE(pmt_n.cnt,0) + 1) / (icn.ins_count + nv.v_payment) )
+         + LN( (COALESCE(cn.cnt,0) + 1) / (icn.ins_count + nv.v_cost) )
+       ) AS log_posterior_no,
+
+       CASE
+         WHEN
+           (
+             LN(py.prior_prob)
+             + LN( (COALESCE(dy.cnt,0) + 1) / (icy.ins_count + nv.v_disease) )
+             + LN( (COALESCE(sy.cnt,0) + 1) / (icy.ins_count + nv.v_state) )
+             + LN( (COALESCE(gy.cnt,0) + 1) / (icy.ins_count + nv.v_gender) )
+             + LN( (COALESCE(ay.cnt,0) + 1) / (icy.ins_count + nv.v_agegroup) )
+             + LN( (COALESCE(pmt_y.cnt,0) + 1) / (icy.ins_count + nv.v_payment) )
+             + LN( (COALESCE(cy.cnt,0) + 1) / (icy.ins_count + nv.v_cost) )
+           )
+           >=
+           (
+             LN(pn.prior_prob)
+             + LN( (COALESCE(dn.cnt,0) + 1) / (icn.ins_count + nv.v_disease) )
+             + LN( (COALESCE(sn.cnt,0) + 1) / (icn.ins_count + nv.v_state) )
+             + LN( (COALESCE(gn.cnt,0) + 1) / (icn.ins_count + nv.v_gender) )
+             + LN( (COALESCE(an.cnt,0) + 1) / (icn.ins_count + nv.v_agegroup) )
+             + LN( (COALESCE(pmt_n.cnt,0) + 1) / (icn.ins_count + nv.v_payment) )
+             + LN( (COALESCE(cn.cnt,0) + 1) / (icn.ins_count + nv.v_cost) )
+           )
+         THEN 'Yes' ELSE 'No'
+       END AS predicted_insurance
+
+FROM healthcare_features f
+CROSS JOIN p_yes py
+CROSS JOIN p_no pn
+CROSS JOIN ic_yes icy
+CROSS JOIN ic_no icn
+CROSS JOIN nb_vocab nv
+
+LEFT JOIN nb_likelihood_disease dy ON f.Disease = dy.Disease AND dy.Insurance = 'Yes'
+LEFT JOIN nb_likelihood_state  sy ON f.State   = sy.State   AND sy.Insurance = 'Yes'
+LEFT JOIN nb_likelihood_gender gy ON f.Gender  = gy.Gender  AND gy.Insurance = 'Yes'
+LEFT JOIN nb_likelihood_agegroup ay ON f.AgeGroup = ay.AgeGroup AND ay.Insurance = 'Yes'
+LEFT JOIN nb_likelihood_payment pmt_y ON f.Payment_Method = pmt_y.Payment_Method AND pmt_y.Insurance = 'Yes'
+LEFT JOIN nb_likelihood_cost cy ON f.Cost_Bucket = cy.Cost_Bucket AND cy.Insurance = 'Yes'
+
+LEFT JOIN nb_likelihood_disease dn ON f.Disease = dn.Disease AND dn.Insurance = 'No'
+LEFT JOIN nb_likelihood_state  sn ON f.State   = sn.State   AND sn.Insurance = 'No'
+LEFT JOIN nb_likelihood_gender gn ON f.Gender  = gn.Gender  AND gn.Insurance = 'No'
+LEFT JOIN nb_likelihood_agegroup an ON f.AgeGroup = an.AgeGroup AND an.Insurance = 'No'
+LEFT JOIN nb_likelihood_payment pmt_n ON f.Payment_Method = pmt_n.Payment_Method AND pmt_n.Insurance = 'No'
+LEFT JOIN nb_likelihood_cost cn ON f.Cost_Bucket = cn.Cost_Bucket AND cn.Insurance = 'No';
+```
+
+---
+
+### 4) `nb_evaluation_insurance.hql`
+
+```sql
+-- Evaluation script for predictions table
+USE healthcare_db;
+
+-- Basic sanity check
+SELECT COUNT(*) AS total_records FROM insurance_predictions;
+
+-- Confusion matrix
+SELECT actual_insurance, predicted_insurance, COUNT(*) AS cnt
+FROM insurance_predictions
+GROUP BY actual_insurance, predicted_insurance
+ORDER BY actual_insurance, predicted_insurance;
+
+-- Overall accuracy (%)
+SELECT ROUND(100.0 * SUM(CASE WHEN actual_insurance = predicted_insurance THEN 1 ELSE 0 END) / COUNT(*), 2) AS accuracy_pct
+FROM insurance_predictions;
+
+-- Precision / Recall / F1 for Insurance = 'Yes' (if needed)
+WITH metrics_yes AS (
+  SELECT
+    SUM(CASE WHEN predicted_insurance = 'Yes' AND actual_insurance = 'Yes' THEN 1 ELSE 0 END) AS TP,
+    SUM(CASE WHEN predicted_insurance = 'Yes' AND actual_insurance <> 'Yes' THEN 1 ELSE 0 END) AS FP,
+    SUM(CASE WHEN predicted_insurance <> 'Yes' AND actual_insurance = 'Yes' THEN 1 ELSE 0 END) AS FN
+  FROM insurance_predictions
+)
+SELECT
+  TP,
+  FP,
+  FN,
+  ROUND(100.0 * TP / NULLIF(TP + FP,0), 2) AS precision_yes_pct,
+  ROUND(100.0 * TP / NULLIF(TP + FN,0), 2) AS recall_yes_pct,
+  ROUND(100.0 * (2.0 * TP) / NULLIF((2.0 * TP + FP + FN),0), 2) AS f1_yes_pct
+FROM metrics_yes;
+
+-- Basic class distribution counts
+SELECT actual_insurance, COUNT(*) AS actual_count FROM insurance_predictions GROUP BY actual_insurance;
+SELECT predicted_insurance, COUNT(*) AS predicted_count FROM insurance_predictions GROUP BY predicted_insurance;
+```
+
+---
