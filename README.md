@@ -152,7 +152,3 @@ This project uses the **MIT License**.
 You can freely use or modify the code.
 
 ---
-
-
-
-Just tell me!
